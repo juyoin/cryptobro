@@ -10,10 +10,8 @@ __pycache__/
 venv/
 env/
 
-# Secrets
-.env
 
 # Local runtime artifacts
 logs/
 *.log
-.env.example
+.env

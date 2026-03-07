@@ -19,7 +19,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from src.ai.brain import evaluate_market_with_ai
+from src.ai.brain import AIJury
 from src.data.market_data import MarketHarvester
 from src.sim.engine import ExecutionEngine
 
@@ -31,7 +31,7 @@ class CryptoOracleApp(ctk.CTk):
 
     def __init__(self) -> None:
         super().__init__()
-        load_dotenv()
+        load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
         ctk.set_appearance_mode("dark")
         ctk.set_default_color_theme("dark-blue")
 
@@ -55,6 +55,7 @@ class CryptoOracleApp(ctk.CTk):
         self.configure(fg_color=self.palette["background"])
 
         self.harvester = MarketHarvester()
+        self.jury = AIJury()
         self.engine = ExecutionEngine(wallet_path="config/wallet.json", history_log_path="history.log")
         self.update_queue: queue.Queue[dict[str, Any]] = queue.Queue()
         self.stop_event = threading.Event()
@@ -63,7 +64,7 @@ class CryptoOracleApp(ctk.CTk):
 
         self.risk_level = os.getenv("RISK_LEVEL", "medium")
         self.investment_amount_usd = self._safe_float(os.getenv("INVESTMENT_AMOUNT_USD", "250"), default=250.0)
-        self.refresh_seconds = max(10, int(self._safe_float(os.getenv("REFRESH_SECONDS", "30"), default=30)))
+        self.refresh_seconds = max(60, int(self._safe_float(os.getenv("REFRESH_SECONDS", "60"), default=60)))
 
         self.status_var = ctk.StringVar(value="Status: Bot Idle")
         self.total_value_var = ctk.StringVar(value="$10,000.00")
@@ -427,7 +428,7 @@ class CryptoOracleApp(ctk.CTk):
                         "as_of_utc": market_dossier.get("as_of_utc"),
                         "coins": {symbol: market_dossier["coins"][symbol]},
                     }
-                    verdict = evaluate_market_with_ai(per_coin_dossier, risk_level=risk_level)
+                    verdict = self.jury.get_jury_verdict(per_coin_dossier, risk_level=risk_level)
                     result = self.engine.execute_from_jury(
                         coin_symbol=symbol,
                         investment_amount_usd=invest_usd,
@@ -463,7 +464,7 @@ class CryptoOracleApp(ctk.CTk):
                 )
             except Exception as exc:
                 self.update_queue.put({"type": "error", "message": f"Worker cycle failed: {exc}"})
-                refresh_seconds = 10
+                refresh_seconds = 60
             finally:
                 self.update_queue.put({"type": "status", "active": False})
 
@@ -582,10 +583,11 @@ class CryptoOracleApp(ctk.CTk):
         hf_key = self.hf_entry.get().strip()
         risk_level = self.risk_var.get().strip().lower() or "medium"
         invest_usd = self._safe_float(self.investment_entry.get().strip(), default=250.0)
-        refresh_seconds = max(10, int(self._safe_float(self.refresh_entry.get().strip(), default=30)))
+        refresh_seconds = max(60, int(self._safe_float(self.refresh_entry.get().strip(), default=60)))
 
         os.environ["GEMINI_API_KEY"] = gemini_key
         os.environ["HUGGINGFACE_API_KEY"] = hf_key
+        self.jury = AIJury()
 
         with self.config_lock:
             self.risk_level = risk_level
@@ -660,3 +662,7 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
