@@ -1,9 +1,15 @@
 ﻿"""GUI entrypoint for Crypto Oracle (SIMULATION ONLY)."""
 
+from __future__ import annotations
 
-def main() -> None:
-    # TODO: Implement CustomTkinter or Flet dashboard in Phase 4.
-    print("Crypto Oracle GUI placeholder")
+import sys
+from pathlib import Path
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from src.gui.main_app import main
 
 
 if __name__ == "__main__":

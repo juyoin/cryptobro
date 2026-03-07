@@ -16,3 +16,4 @@ env/
 # Local runtime artifacts
 logs/
 *.log
+.env.example

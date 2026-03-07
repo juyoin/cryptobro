@@ -1,24 +1,235 @@
-﻿"""AI Jury module (SIMULATION ONLY).
-
-Phase 2 placeholder:
-- Accept market dossier.
-- Query multiple AI models.
-- Return normalized votes: action/confidence/reasoning.
-"""
+﻿"""Phase 2 AI Jury for Crypto Oracle (SIMULATION ONLY)."""
 
 from __future__ import annotations
 
-from typing import Any
+import json
+import os
+import re
+from datetime import datetime, timezone
+from typing import Any, Callable
+
+import requests
+
+ALLOWED_ACTIONS = {"BUY", "SELL", "HOLD"}
 
 
-def evaluate_market_with_ai(dossier: dict[str, Any]) -> list[dict[str, Any]]:
-    # TODO: Integrate LiteLLM / direct provider clients.
-    # Keep strict JSON schema for parser safety.
-    return [
-        {
-            "model": "placeholder-model",
-            "action": "HOLD",
-            "confidence": 0.5,
-            "reasoning": "Phase 2 not implemented yet.",
+class AIRateLimitError(Exception):
+    """Raised when an AI provider responds with HTTP 429."""
+
+
+class AIJury:
+    """Queries multiple AI models and normalizes their trading votes."""
+
+    def __init__(
+        self,
+        gemini_api_key: str | None = None,
+        huggingface_api_key: str | None = None,
+        gemini_model: str | None = None,
+        huggingface_model: str | None = None,
+        timeout_seconds: int = 30,
+    ) -> None:
+        self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY", "")
+        self.huggingface_api_key = huggingface_api_key or os.getenv("HUGGINGFACE_API_KEY", "")
+        self.gemini_model = gemini_model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        self.huggingface_model = huggingface_model or os.getenv("HUGGINGFACE_MODEL", "google/gemma-2-2b-it")
+        self.timeout_seconds = timeout_seconds
+        self.session = requests.Session()
+
+    def get_market_prompt(self, market_dossier: dict[str, Any], risk_level: str = "medium") -> str:
+        compact_dossier = json.dumps(market_dossier, separators=(",", ":"))
+        return (
+            "You are a crypto analyst in a paper-trading SIMULATION ONLY environment. "
+            "Never give real financial advice. Analyze the market dossier and return exactly one JSON object "
+            "with this schema: {\"action\":\"BUY|SELL|HOLD\",\"confidence\":0.0-1.0,\"reasoning\":\"short text\"}. "
+            f"Risk level: {risk_level}. Market dossier: {compact_dossier}"
+        )
+
+    def get_market_dossier_votes(self, market_dossier: dict[str, Any], risk_level: str = "medium") -> list[dict[str, Any]]:
+        prompt = self.get_market_prompt(market_dossier=market_dossier, risk_level=risk_level)
+
+        votes = [
+            self._get_vote(provider="gemini", model=self.gemini_model, request_fn=lambda: self._query_gemini(prompt)),
+            self._get_vote(
+                provider="huggingface",
+                model=self.huggingface_model,
+                request_fn=lambda: self._query_huggingface(prompt),
+            ),
+        ]
+
+        return votes
+
+    def get_consensus(self, votes: list[dict[str, Any]]) -> dict[str, Any]:
+        valid_votes = [vote for vote in votes if vote.get("error") is None]
+
+        if not valid_votes:
+            return {
+                "consensus_action": "HOLD",
+                "average_confidence": 0.0,
+                "vote_count": 0,
+            }
+
+        average_confidence = sum(float(v["confidence"]) for v in valid_votes) / len(valid_votes)
+
+        buy_votes = sum(1 for vote in valid_votes if vote["action"] == "BUY")
+        sell_votes = sum(1 for vote in valid_votes if vote["action"] == "SELL")
+        hold_votes = sum(1 for vote in valid_votes if vote["action"] == "HOLD")
+
+        if buy_votes > sell_votes and buy_votes > hold_votes:
+            consensus_action = "BUY"
+        elif sell_votes > buy_votes and sell_votes > hold_votes:
+            consensus_action = "SELL"
+        else:
+            consensus_action = "HOLD"
+
+        return {
+            "consensus_action": consensus_action,
+            "average_confidence": round(average_confidence, 4),
+            "vote_count": len(valid_votes),
         }
-    ]
+
+    def get_jury_verdict(self, market_dossier: dict[str, Any], risk_level: str = "medium") -> dict[str, Any]:
+        votes = self.get_market_dossier_votes(market_dossier=market_dossier, risk_level=risk_level)
+        consensus = self.get_consensus(votes)
+        return {
+            "simulation": True,
+            "as_of_utc": datetime.now(timezone.utc).isoformat(),
+            "votes": votes,
+            "consensus": consensus,
+        }
+
+    def _get_vote(self, provider: str, model: str, request_fn: Callable[[], str]) -> dict[str, Any]:
+        if provider == "gemini" and not self.gemini_api_key:
+            return self._error_vote(provider, model, "Missing GEMINI_API_KEY")
+        if provider == "huggingface" and not self.huggingface_api_key:
+            return self._error_vote(provider, model, "Missing HUGGINGFACE_API_KEY")
+
+        try:
+            raw_text = request_fn()
+            parsed = self._parse_ai_json(raw_text)
+            return {
+                "provider": provider,
+                "model": model,
+                "action": parsed["action"],
+                "confidence": parsed["confidence"],
+                "reasoning": parsed["reasoning"],
+                "error": None,
+            }
+        except Exception as exc:
+            return self._error_vote(provider, model, str(exc))
+
+    def _query_gemini(self, prompt: str) -> str:
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
+        params = {"key": self.gemini_api_key}
+        payload = {
+            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+            "generationConfig": {
+                "temperature": 0.2,
+                "maxOutputTokens": 220,
+            },
+        }
+
+        response = self.session.post(url, params=params, json=payload, timeout=self.timeout_seconds)
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "unknown")
+            raise AIRateLimitError(f"Gemini rate limit hit (HTTP 429). Retry-After={retry_after}")
+        response.raise_for_status()
+
+        data = response.json()
+        candidates = data.get("candidates", [])
+        if not candidates:
+            raise ValueError("Gemini response contains no candidates")
+
+        parts = candidates[0].get("content", {}).get("parts", [])
+        text = "".join(str(part.get("text", "")) for part in parts)
+        if not text:
+            raise ValueError("Gemini response contains empty text")
+
+        return text
+
+    def _query_huggingface(self, prompt: str) -> str:
+        url = f"https://api-inference.huggingface.co/models/{self.huggingface_model}"
+        headers = {
+            "Authorization": f"Bearer {self.huggingface_api_key}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "inputs": prompt,
+            "parameters": {
+                "temperature": 0.2,
+                "max_new_tokens": 220,
+                "return_full_text": False,
+            },
+        }
+
+        response = self.session.post(url, headers=headers, json=payload, timeout=self.timeout_seconds)
+        if response.status_code == 429:
+            retry_after = response.headers.get("Retry-After", "unknown")
+            raise AIRateLimitError(f"Hugging Face rate limit hit (HTTP 429). Retry-After={retry_after}")
+        response.raise_for_status()
+
+        data = response.json()
+        if isinstance(data, list) and data:
+            generated = data[0].get("generated_text", "")
+            if generated:
+                return str(generated)
+
+        if isinstance(data, dict):
+            if data.get("error"):
+                raise ValueError(f"Hugging Face error: {data['error']}")
+            generated = data.get("generated_text", "")
+            if generated:
+                return str(generated)
+
+        raise ValueError("Unexpected Hugging Face response format")
+
+    def _parse_ai_json(self, response_text: str) -> dict[str, Any]:
+        candidate = response_text.strip()
+        candidate = re.sub(r"^```json\\s*", "", candidate, flags=re.IGNORECASE)
+        candidate = re.sub(r"^```\\s*", "", candidate)
+        candidate = re.sub(r"```$", "", candidate).strip()
+
+        if not candidate.startswith("{"):
+            json_match = re.search(r"\{.*\}", candidate, flags=re.DOTALL)
+            if not json_match:
+                raise ValueError("No JSON object found in model response")
+            candidate = json_match.group(0)
+
+        parsed = json.loads(candidate)
+
+        action = str(parsed.get("action", "")).upper()
+        confidence_raw = parsed.get("confidence")
+        reasoning = str(parsed.get("reasoning", "")).strip()
+
+        if action not in ALLOWED_ACTIONS:
+            raise ValueError(f"Invalid action: {action}")
+
+        try:
+            confidence = float(confidence_raw)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("Confidence must be a number") from exc
+
+        if confidence < 0.0 or confidence > 1.0:
+            raise ValueError("Confidence must be between 0 and 1")
+        if not reasoning:
+            raise ValueError("Reasoning cannot be empty")
+
+        return {
+            "action": action,
+            "confidence": confidence,
+            "reasoning": reasoning,
+        }
+
+    def _error_vote(self, provider: str, model: str, error_message: str) -> dict[str, Any]:
+        return {
+            "provider": provider,
+            "model": model,
+            "action": "HOLD",
+            "confidence": 0.0,
+            "reasoning": "Provider unavailable; defaulting to HOLD for simulation safety.",
+            "error": error_message,
+        }
+
+
+def evaluate_market_with_ai(market_dossier: dict[str, Any], risk_level: str = "medium") -> dict[str, Any]:
+    jury = AIJury()
+    return jury.get_jury_verdict(market_dossier=market_dossier, risk_level=risk_level)
