@@ -1,0 +1,20 @@
+﻿{
+  "simulation": true,
+  "base_currency": "USD",
+  "cash_usd": 10000.0,
+  "positions": {
+    "BTC": {
+      "units": 0.0,
+      "avg_entry_price_usd": 0.0
+    },
+    "ETH": {
+      "units": 0.0,
+      "avg_entry_price_usd": 0.0
+    },
+    "SOL": {
+      "units": 0.0,
+      "avg_entry_price_usd": 0.0
+    }
+  },
+  "trade_log": []
+}
