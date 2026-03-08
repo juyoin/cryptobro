@@ -73,6 +73,8 @@ class CryptoOracleApp(ctk.CTk):
 
         self.coin_widgets: dict[str, dict[str, Any]] = {}
         self.portfolio_history: list[tuple[datetime, float]] = []
+        self.last_coin_actions: dict[str, str] = {symbol: "HOLD" for symbol in self.COINS}
+        self.cycle_index = 0
 
         self.bot_active = False
         self.heartbeat_frames = ["", ".", "..", "..."]
@@ -319,12 +321,12 @@ class CryptoOracleApp(ctk.CTk):
             text_color=self.palette["text"],
         ).grid(row=0, column=0, columnspan=2, padx=16, pady=(16, 14), sticky="w")
 
-        ctk.CTkLabel(panel, text="Gemini API Key", text_color=self.palette["text"]).grid(
+        ctk.CTkLabel(panel, text="Groq API Key", text_color=self.palette["text"]).grid(
             row=1, column=0, padx=16, pady=6, sticky="w"
         )
-        self.gemini_entry = ctk.CTkEntry(panel, width=360, show="*", text_color=self.palette["text"])
-        self.gemini_entry.grid(row=1, column=1, padx=12, pady=6, sticky="w")
-        self.gemini_entry.insert(0, os.getenv("GEMINI_API_KEY", ""))
+        self.groq_entry = ctk.CTkEntry(panel, width=360, show="*", text_color=self.palette["text"])
+        self.groq_entry.grid(row=1, column=1, padx=12, pady=6, sticky="w")
+        self.groq_entry.insert(0, os.getenv("GROQ_API_KEY", ""))
 
         ctk.CTkLabel(panel, text="Hugging Face API Key", text_color=self.palette["text"]).grid(
             row=2, column=0, padx=16, pady=6, sticky="w"
@@ -415,41 +417,41 @@ class CryptoOracleApp(ctk.CTk):
                     risk_level = self.risk_level
                     invest_usd = self.investment_amount_usd
                     refresh_seconds = self.refresh_seconds
-
                 market_dossier = self.harvester.get_market_dossier()
                 cycle_lines: list[str] = []
-                coin_actions: dict[str, str] = {}
 
-                for symbol in self.COINS:
-                    self.update_queue.put({"type": "status", "active": True})
-                    per_coin_dossier = {
-                        "simulation": market_dossier.get("simulation", True),
-                        "source": market_dossier.get("source", "coingecko"),
-                        "as_of_utc": market_dossier.get("as_of_utc"),
-                        "coins": {symbol: market_dossier["coins"][symbol]},
-                    }
-                    verdict = self.jury.get_jury_verdict(per_coin_dossier, risk_level=risk_level)
-                    result = self.engine.execute_from_jury(
-                        coin_symbol=symbol,
-                        investment_amount_usd=invest_usd,
-                        jury_verdict=verdict,
-                        market_dossier=market_dossier,
-                    )
+                # Rate-limit friendly mode: one AI decision per cycle, rotating coin symbols.
+                symbol = self.COINS[self.cycle_index % len(self.COINS)]
+                self.cycle_index += 1
 
-                    consensus = verdict.get("consensus", {})
-                    action = str(consensus.get("consensus_action", "HOLD")).upper()
-                    confidence = float(consensus.get("average_confidence", 0.0))
-                    coin_actions[symbol] = action
+                per_coin_dossier = {
+                    "simulation": market_dossier.get("simulation", True),
+                    "source": market_dossier.get("source", "coingecko"),
+                    "as_of_utc": market_dossier.get("as_of_utc"),
+                    "coins": {symbol: market_dossier["coins"][symbol]},
+                }
+                verdict = self.jury.get_jury_verdict(per_coin_dossier, risk_level=risk_level)
+                result = self.engine.execute_from_jury(
+                    coin_symbol=symbol,
+                    investment_amount_usd=invest_usd,
+                    jury_verdict=verdict,
+                    market_dossier=market_dossier,
+                )
 
-                    cycle_lines.append(f"{symbol} -> {action} (confidence={confidence:.2f}) | {result.message}")
-                    for vote in verdict.get("votes", []):
-                        provider = str(vote.get("provider", "model")).title()
-                        reason = str(vote.get("reasoning", "")).strip()
-                        error = str(vote.get("error", "")).strip()
-                        if error:
-                            cycle_lines.append(f"{provider}: {reason} [error: {error}]")
-                        elif reason:
-                            cycle_lines.append(f"{provider}: {reason}")
+                consensus = verdict.get("consensus", {})
+                action = str(consensus.get("consensus_action", "HOLD")).upper()
+                confidence = float(consensus.get("average_confidence", 0.0))
+                self.last_coin_actions[symbol] = action
+
+                cycle_lines.append(f"{symbol} -> {action} (confidence={confidence:.2f}) | {result.message}")
+                for vote in verdict.get("votes", []):
+                    provider = str(vote.get("provider", "model")).title()
+                    reason = str(vote.get("reasoning", "")).strip()
+                    error = str(vote.get("error", "")).strip()
+                    if error:
+                        cycle_lines.append(f"{provider}: {reason} [error: {error}]")
+                    elif reason:
+                        cycle_lines.append(f"{provider}: {reason}")
 
                 wallet = self.engine.load_wallet()
                 portfolio_value = self._compute_portfolio_value(wallet=wallet, market_dossier=market_dossier)
@@ -457,7 +459,7 @@ class CryptoOracleApp(ctk.CTk):
                     {
                         "type": "cycle",
                         "market_dossier": market_dossier,
-                        "coin_actions": coin_actions,
+                        "coin_actions": dict(self.last_coin_actions),
                         "portfolio_value": portfolio_value,
                         "lines": cycle_lines,
                     }
@@ -579,13 +581,13 @@ class CryptoOracleApp(ctk.CTk):
         self.trade_history_text.configure(state="disabled")
 
     def _save_settings(self) -> None:
-        gemini_key = self.gemini_entry.get().strip()
+        groq_key = self.groq_entry.get().strip()
         hf_key = self.hf_entry.get().strip()
         risk_level = self.risk_var.get().strip().lower() or "medium"
         invest_usd = self._safe_float(self.investment_entry.get().strip(), default=250.0)
         refresh_seconds = max(60, int(self._safe_float(self.refresh_entry.get().strip(), default=60)))
 
-        os.environ["GEMINI_API_KEY"] = gemini_key
+        os.environ["GROQ_API_KEY"] = groq_key
         os.environ["HUGGINGFACE_API_KEY"] = hf_key
         self.jury = AIJury()
 
@@ -596,7 +598,7 @@ class CryptoOracleApp(ctk.CTk):
 
         self._upsert_env_values(
             {
-                "GEMINI_API_KEY": gemini_key,
+                "GROQ_API_KEY": groq_key,
                 "HUGGINGFACE_API_KEY": hf_key,
                 "RISK_LEVEL": risk_level,
                 "INVESTMENT_AMOUNT_USD": f"{invest_usd}",
@@ -662,6 +664,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+
+
+
 
 
 

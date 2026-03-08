@@ -19,6 +19,7 @@ load_dotenv(dotenv_path=PROJECT_ROOT / ".env", override=False)
 
 ALLOWED_ACTIONS = {"BUY", "SELL", "HOLD"}
 HF_ROUTER_URL = "https://router.huggingface.co"
+GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 
 class AIRateLimitError(Exception):
@@ -30,24 +31,24 @@ class AIJury:
 
     def __init__(
         self,
-        gemini_api_key: str | None = None,
         huggingface_api_key: str | None = None,
-        gemini_model: str | None = None,
+        groq_api_key: str | None = None,
         huggingface_model: str | None = None,
+        groq_model: str | None = None,
         timeout_seconds: int = 30,
         max_retries: int = 3,
-        backoff_base_seconds: float = 2.0,
+        backoff_base_seconds: float = 15.0,
         provider_cooldown_seconds: int = 300,
     ) -> None:
-        self.gemini_api_key = gemini_api_key or os.getenv("GEMINI_API_KEY", "")
         self.huggingface_api_key = huggingface_api_key or os.getenv("HUGGINGFACE_API_KEY", "")
-        self.gemini_model = gemini_model or os.getenv("GEMINI_MODEL", "gemini-2.0-flash")
+        self.groq_api_key = groq_api_key or os.getenv("GROQ_API_KEY", "")
         self.huggingface_model = huggingface_model or os.getenv("HUGGINGFACE_MODEL", "meta-llama/Llama-3.2-1B-Instruct")
+        self.groq_model = groq_model or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
         self.backoff_base_seconds = backoff_base_seconds
         self.provider_cooldown_seconds = provider_cooldown_seconds
-        self.provider_cooldowns: dict[str, float] = {"gemini": 0.0, "huggingface": 0.0}
+        self.provider_cooldowns: dict[str, float] = {"huggingface": 0.0, "groq": 0.0}
         self.session = requests.Session()
 
     def get_market_prompt(self, market_dossier: dict[str, Any], risk_level: str = "medium") -> str:
@@ -61,17 +62,14 @@ class AIJury:
 
     def get_market_dossier_votes(self, market_dossier: dict[str, Any], risk_level: str = "medium") -> list[dict[str, Any]]:
         prompt = self.get_market_prompt(market_dossier=market_dossier, risk_level=risk_level)
-
-        votes = [
-            self._get_vote(provider="gemini", model=self.gemini_model, request_fn=lambda: self._query_gemini(prompt)),
+        return [
+            self._get_vote(provider="groq", model=self.groq_model, request_fn=lambda: self._query_groq(prompt)),
             self._get_vote(
                 provider="huggingface",
                 model=self.huggingface_model,
                 request_fn=lambda: self._query_huggingface(prompt),
             ),
         ]
-
-        return votes
 
     def get_consensus(self, votes: list[dict[str, Any]]) -> dict[str, Any]:
         valid_votes = [vote for vote in votes if vote.get("error") is None]
@@ -113,10 +111,10 @@ class AIJury:
         }
 
     def _get_vote(self, provider: str, model: str, request_fn: Callable[[], str]) -> dict[str, Any]:
-        if provider == "gemini" and not self.gemini_api_key:
-            return self._error_vote(provider, model, "Missing GEMINI_API_KEY")
         if provider == "huggingface" and not self.huggingface_api_key:
             return self._error_vote(provider, model, "Missing HUGGINGFACE_API_KEY")
+        if provider == "groq" and not self.groq_api_key:
+            return self._error_vote(provider, model, "Missing GROQ_API_KEY")
 
         cooldown_remaining = self._cooldown_remaining_seconds(provider)
         if cooldown_remaining > 0:
@@ -130,11 +128,20 @@ class AIJury:
         except Exception as exc:
             return self._error_vote(provider, model, str(exc))
 
-        # Explicit parse guard so malformed model output does not crash the jury.
         try:
             parsed = self._parse_ai_json(raw_text)
         except Exception as exc:
             if "No JSON object found" in str(exc):
+                fallback = self._fallback_vote_from_text(raw_text)
+                if fallback is not None:
+                    return {
+                        "provider": provider,
+                        "model": model,
+                        "action": fallback["action"],
+                        "confidence": fallback["confidence"],
+                        "reasoning": fallback["reasoning"],
+                        "error": None,
+                    }
                 return self._error_vote(provider, model, f"Parser warning: {exc}")
             return self._error_vote(provider, model, str(exc))
 
@@ -147,42 +154,43 @@ class AIJury:
             "error": None,
         }
 
-    def _query_gemini(self, prompt: str) -> str:
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent"
-        params = {"key": self.gemini_api_key}
+    def _query_groq(self, prompt: str) -> str:
+        headers = {
+            "Authorization": f"Bearer {self.groq_api_key}",
+            "Content-Type": "application/json",
+        }
         payload = {
-            "contents": [{"role": "user", "parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.2,
-                "maxOutputTokens": 220,
-            },
+            "model": self.groq_model,
+            "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0.2,
+            "max_tokens": 220,
         }
 
         for attempt in range(self.max_retries + 1):
-            response = self.session.post(url, params=params, json=payload, timeout=self.timeout_seconds)
+            response = self.session.post(GROQ_API_URL, headers=headers, json=payload, timeout=self.timeout_seconds)
             if response.status_code != 429:
                 response.raise_for_status()
                 data = response.json()
-                candidates = data.get("candidates", [])
-                if not candidates:
-                    raise ValueError("Gemini response contains no candidates")
+                choices = data.get("choices", []) if isinstance(data, dict) else []
+                if not choices:
+                    raise ValueError("Unexpected Groq response format: missing choices")
 
-                parts = candidates[0].get("content", {}).get("parts", [])
-                text = "".join(str(part.get("text", "")) for part in parts)
+                content = choices[0].get("message", {}).get("content", "")
+                text = str(content).strip()
                 if not text:
-                    raise ValueError("Gemini response contains empty text")
+                    raise ValueError("Groq response contains empty content")
                 return text
 
             if attempt >= self.max_retries:
                 retry_after = response.headers.get("Retry-After", "unknown")
-                raise AIRateLimitError(f"Gemini rate limit hit (HTTP 429). Retry-After={retry_after}")
+                raise AIRateLimitError(f"Groq rate limit hit (HTTP 429). Retry-After={retry_after}")
 
             retry_after_seconds = self._retry_after_to_seconds(response.headers.get("Retry-After"))
             backoff = self.backoff_base_seconds * (2**attempt)
             sleep_seconds = retry_after_seconds if retry_after_seconds is not None else backoff
             time.sleep(max(1.0, sleep_seconds))
 
-        raise AIRateLimitError("Gemini rate limit retries exhausted")
+        raise AIRateLimitError("Groq rate limit retries exhausted")
 
     def _query_huggingface(self, prompt: str) -> str:
         url = f"{HF_ROUTER_URL}/v1/chat/completions"
@@ -257,6 +265,37 @@ class AIJury:
         if not reasoning:
             raise ValueError("Reasoning cannot be empty")
 
+        return {
+            "action": action,
+            "confidence": confidence,
+            "reasoning": reasoning,
+        }
+
+    def _fallback_vote_from_text(self, response_text: str) -> dict[str, Any] | None:
+        text = response_text.strip()
+        lower_text = f" {text.lower()} "
+
+        action: str | None = None
+        if any(token in lower_text for token in (" hold ", " neutral ", " wait ", " sideways ")):
+            action = "HOLD"
+        if any(token in lower_text for token in (" sell ", " bearish ", " take profit", " de-risk")):
+            action = "SELL"
+        if any(token in lower_text for token in (" buy ", " bullish ", " accumulate ", " oversold ")):
+            action = "BUY"
+
+        if action is None:
+            return None
+
+        confidence = 0.62
+        pct_match = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", text)
+        if pct_match:
+            confidence = min(1.0, max(0.0, float(pct_match.group(1)) / 100.0))
+        else:
+            float_match = re.search(r"\b(0(?:\.\d+)?|1(?:\.0+)?)\b", text)
+            if float_match:
+                confidence = min(1.0, max(0.0, float(float_match.group(1))))
+
+        reasoning = text.split("\n")[0].strip()[:220] or "Fallback parsed from non-JSON model output."
         return {
             "action": action,
             "confidence": confidence,
